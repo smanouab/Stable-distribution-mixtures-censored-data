@@ -1,6 +1,6 @@
-# Mélanges de lois α-stables en présence de données censurées
+# Estimation and Inference for Censored Mixtures of α-Stable Distributions
 
-**A detailed R Markdown notebook for parameter estimation in mixtures of α-stable distributions with censored data.**
+**A detailed R Markdown notebook for pEstimation and Inference for Censored Mixtures of α-Stable Distributions.**
 
 **Authors:** Solym Mawaki MANOU-ABI and Ibrahim SADOK
 
