@@ -174,7 +174,7 @@ If you use this code or the associated computational framework in your research,
   title  = {Parameter Estimation for Mixtures of Alpha-Stable
             Distributions in the Presence of Censored Data},
   author = {Manou-Abi, Solym Mawaki and Sadok, Ibrahim},
-  year   = {YEAR}
+  year   = {Preprint 2026}
 }
 ```
 
