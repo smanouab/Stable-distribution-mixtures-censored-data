@@ -159,9 +159,8 @@ For reproducibility, users are encouraged to record their R version, package ver
 ## Authors
 
 **Solym Mawaki MANOU-ABI**  
-Université de Poitiers, France  
 Laboratoire de Mathématiques et Applications (UMR CNRS 7348)  
-École Nationale Supérieure d'Ingénieurs de Poitiers (ENSAR)
+École  d'Ingénieurs ENSAR, Université de Poitiers, France
 
 **Ibrahim SADOK**
 
