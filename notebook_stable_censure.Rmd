@@ -1,0 +1,1312 @@
+---
+title: "Mélanges de lois α-stables en présence de données censurées — notebook détaillé"
+author: "Solym Mawaki MANOU-ABI, Ibrahim SADOK"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  mode: "rapide"        # "rapide" (test, quelques minutes) ou "complet" (article)
+  run_simulation: true
+  run_applications: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, comment = "#>")
+```
+
+# Objet du notebook
+
+Ce notebook rassemble, explique et exécute pas à pas le code de l'article
+*Parameter Estimation for Mixtures of α-Stable Distributions in the Presence of
+Censored Data*. Il reprend intégralement les trois fichiers :
+
+| Fichier | Contenu | Partie du notebook |
+|---|---|---|
+| `R/00_functions.R` | toutes les fonctions (estimateurs, algorithmes, utilitaires) | §2 à §11 |
+| `R/01_simulation.R` | études de Monte-Carlo A, B, C (section 8 de l'article) | §12 |
+| `R/02_applications.R` | intervalle sériel de Mayotte et données enzyme (section 9) | §13 |
+
+Chaque bloc de fonctions est suivi d'un **test de contrôle** qui vérifie sur un
+petit exemple que la fonction fait ce qu'elle doit faire. Les simulations
+existent en deux modes, réglés par le paramètre `mode` de l'en-tête YAML :
+
+* `rapide` : peu de réplications, pour vérifier que tout tourne (quelques minutes) ;
+* `complet` : réglages de l'article (plusieurs heures selon la machine).
+
+Les tableaux (`tables/*.tex`) et figures (`figures/*.pdf`) produits sont lus
+automatiquement par `main.tex`. Le notebook doit donc être exécuté **depuis le
+dossier racine de l'article** (celui qui contient `main.tex`).
+
+**Conventions communes à tout le code.**
+
+* Paramétrisation $S_0$ de Nolan : `pars = c(alpha, beta, gamma, delta)`,
+  exactement celle de `libstable4u` avec `parametrization = 0`.
+* Codage des observations (une ligne par observation) :
+    * valeur exacte : `lo = x`, `hi = x` ;
+    * censure à droite : `lo = y`, `hi = Inf` (on sait seulement que $X > y$) ;
+    * censure par intervalle : `lo = l`, `hi = r` (on sait que $l < X < r$).
+* Les modifications par rapport au code Rmd d'origine (22/01/2023) sont signalées
+  par `FIX:` dans les commentaires.
+
+# Installation et chargement des paquets
+
+```{r packages}
+## Paquets nécessaires (à installer une seule fois)
+pkgs <- c("libstable4u", "parallel")
+opt  <- c("BNPdensity", "readxl")          # facultatifs : enzyme, incidence
+manquants <- setdiff(c(pkgs, opt), rownames(installed.packages()))
+if (length(manquants)) message("Paquets non installés : ", paste(manquants, collapse = ", "),
+                               "\n -> install.packages(c(", paste0('"', manquants, '"', collapse = ", "), "))")
+
+suppressPackageStartupMessages({
+  library(libstable4u)
+  library(parallel)
+})
+dir.create("tables",  showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+dir.create("data",    showWarnings = FALSE)
+sessionInfo()$R.version$version.string
+```
+
+# Outils de base pour les lois stables
+
+`libstable4u` fournit densité, fonction de répartition, quantiles et
+simulateur. On les enveloppe dans de petites fonctions à la paramétrisation
+$S_0$ fixée :
+
+* `dstab` est minorée par $10^{-300}$ pour que `log(dstab(...))` ne vaille jamais `-Inf` ;
+* `sstab` calcule la **queue droite** $S(x) = P(X > x)$ par réflexion : si
+  $X \sim S_0(\alpha,\beta,\gamma,\delta)$ alors $-X \sim S_0(\alpha,-\beta,\gamma,-\delta)$,
+  donc $S(x) = F_{-X}(-x)$. Cela évite l'annulation numérique de `1 - pstab(x)`
+  loin dans la queue ;
+* `cf_stable` est la fonction caractéristique théorique (équation (2.1) de l'article) ;
+* `dmix` est la densité d'un mélange de poids `w` et de paramètres `P` (une ligne par composante).
+
+```{r helpers}
+dstab <- function(x, p) pmax(stable_pdf(x, pars = p, parametrization = 0L), 1e-300)
+pstab <- function(x, p) stable_cdf(x, pars = p, parametrization = 0L)
+qstab <- function(u, p) stable_q(u, pars = p, parametrization = 0L)
+rstab <- function(n, p) stable_rnd(n, pars = p, parametrization = 0L)
+
+## Queue droite par réflexion (précise loin dans la queue)
+sstab <- function(x, p) pstab(-x, c(p[1], -p[2], p[3], -p[4]))
+
+## Fonction caractéristique S0
+cf_stable <- function(t, p) {
+  a <- p[1]; b <- p[2]; g <- p[3]; d <- p[4]
+  if (abs(a - 1) < 1e-8) {
+    lg <- ifelse(t == 0, 0, log(g * abs(t)))
+    return(exp(-g * abs(t) * (1 + 1i * b * (2 / pi) * sign(t) * lg) + 1i * d * t))
+  }
+  exp(-g^a * abs(t)^a * (1 + 1i * b * tan(pi * a / 2) * sign(t) *
+                           (abs(g * t)^(1 - a) - 1)) + 1i * d * t)
+}
+
+## Densité d'un mélange
+dmix <- function(x, w, P) {
+  out <- 0
+  for (k in seq_along(w)) out <- out + w[k] * dstab(x, P[k, ])
+  out
+}
+
+## log(sum(exp(v))) stable numériquement
+logsumexp <- function(v) { m <- max(v); m + log(sum(exp(v - m))) }
+```
+
+**Test de contrôle.** La queue par réflexion doit coïncider avec `1 - pstab`
+là où cette dernière est précise, et rester positive bien plus loin. La
+fonction caractéristique théorique doit coïncider avec la FC empirique d'un
+grand échantillon.
+
+```{r test-helpers}
+p_test <- c(1.5, 0.5, 1, 0)
+x <- c(0, 2, 10, 1e3, 1e6)
+data.frame(x = x, `1 - pstab` = 1 - pstab(x, p_test), sstab = sstab(x, p_test), check.names = FALSE)
+
+set.seed(1)
+xs <- rstab(1e5, p_test); tt <- c(0.25, 0.5, 1)
+rbind(theorique = cf_stable(tt, p_test), empirique = colMeans(exp(1i * outer(xs, tt))))
+```
+
+# Simulation d'une loi stable tronquée
+
+C'est la brique de base des algorithmes SEM et bayésien : il faut tirer la
+valeur non observée $X_i$ sachant $X_i \in (\ell_i, r_i)$. On utilise
+l'**inversion de la fonction de répartition** (équation (6.4) de l'article) :
+
+$$X = F^{-1}\big(F(\ell) + V\{F(r) - F(\ell)\}\big), \qquad V \sim \mathcal U(0,1).$$
+
+* Censure à droite ($r = \infty$) : on résout $S(X) = V\,S(\ell)$ par réflexion.
+* Si $S(\ell) < 10^{-12}$ (queue extrême), on utilise l'approximation de Pareto
+  $X = \ell + (|\ell| + \gamma)(V^{-1/\alpha} - 1)$.
+* Si l'intervalle a une probabilité quasi nulle, on prend son milieu.
+
+```{r rtrunc}
+## FIX: tirage exact par inversion (le brouillon proposait un rejet avec proposition de Pareto)
+rtrunc_stab <- function(lo, hi, p) {
+  n <- length(lo); out <- numeric(n); v <- runif(n)
+  rc <- is.infinite(hi)
+  if (any(rc)) {                               # censure à droite : X > lo
+    s  <- sstab(lo[rc], p)
+    xr <- numeric(sum(rc))
+    ok <- s > 1e-12
+    if (any(ok)) {                             # S(x) = v * S(lo) par réflexion
+      pr <- c(p[1], -p[2], p[3], -p[4])
+      xr[ok] <- -qstab(v[rc][ok] * s[ok], pr)
+    }
+    if (any(!ok)) {                            # queue extrême : approximation de Pareto
+      l <- lo[rc][!ok]
+      xr[!ok] <- l + (abs(l) + p[3]) * (v[rc][!ok]^(-1 / p[1]) - 1)
+    }
+    out[rc] <- pmax(xr, lo[rc])
+  }
+  ic <- !rc
+  if (any(ic)) {                               # censure par intervalle : lo < X < hi
+    Fl <- pstab(lo[ic], p); Fh <- pstab(hi[ic], p)
+    xi <- (lo[ic] + hi[ic]) / 2
+    ok <- (Fh - Fl) > 1e-12
+    if (any(ok)) xi[ok] <- qstab(Fl[ok] + v[ic][ok] * (Fh[ok] - Fl[ok]), p)
+    out[ic] <- pmin(pmax(xi, lo[ic]), hi[ic])
+  }
+  out
+}
+```
+
+**Test de contrôle.** L'histogramme de 5 000 tirages doit suivre la densité
+tronquée $f(x)/S(\ell)$ sur $(\ell, \infty)$, et $f(x)/\{F(r)-F(\ell)\}$ sur $(\ell, r)$.
+
+```{r test-rtrunc, fig.height=3.5}
+set.seed(2)
+par(mfrow = c(1, 2))
+z <- rtrunc_stab(rep(1, 5000), rep(Inf, 5000), p_test)
+hist(z[z < 8], breaks = 60, freq = FALSE, main = "Tronquée à X > 1", xlab = "x")
+curve(dstab(x, p_test) / sstab(1, p_test), 1, 8, add = TRUE, col = "red", lwd = 2)
+z <- rtrunc_stab(rep(-1, 5000), rep(2, 5000), p_test)
+hist(z, breaks = 40, freq = FALSE, main = "Tronquée à -1 < X < 2", xlab = "x")
+curve(dstab(x, p_test) / (pstab(2, p_test) - pstab(-1, p_test)), -1, 2, add = TRUE, col = "red", lwd = 2)
+```
+
+# Log-vraisemblance observée
+
+Contribution de chaque observation (équation (3.5) de l'article) :
+
+* exacte : $\log f(x)$ ;
+* censurée à droite : $\log S(y)$ ;
+* censurée par intervalle : $\log\{F(r) - F(\ell)\}$.
+
+Pour l'optimisation et le MCMC, on travaille sur une **échelle non contrainte** :
+$\theta = (\mathrm{logit}(\alpha/2), \mathrm{artanh}\,\beta, \log\gamma, \delta)$, qui
+garantit $\alpha\in(0,2)$, $\beta\in(-1,1)$ et $\gamma>0$ sans troncature.
+
+```{r loglik}
+loglik_obs <- function(p, lo, hi) {
+  ex <- lo == hi; rc <- !ex & is.infinite(hi); ic <- !ex & !rc
+  ll <- numeric(length(lo))
+  if (any(ex)) ll[ex] <- log(dstab(lo[ex], p))
+  if (any(rc)) ll[rc] <- log(pmax(sstab(lo[rc], p), 1e-300))
+  if (any(ic)) ll[ic] <- log(pmax(pstab(hi[ic], p) - pstab(lo[ic], p), 1e-300))
+  ll
+}
+
+## Reparamétrisation non contrainte
+th2p <- function(th) c(2 * plogis(th[1]), tanh(th[2]), exp(th[3]), th[4])
+p2th <- function(p) c(qlogis(min(max(p[1] / 2, 1e-4), 1 - 1e-4)),
+                      atanh(min(max(p[2], -0.999), 0.999)),
+                      log(max(p[3], 1e-8)), p[4])
+```
+
+```{r test-loglik}
+## Les trois types d'observations, et aller-retour de la reparamétrisation
+loglik_obs(p_test, lo = c(0.5, 2, -1), hi = c(0.5, Inf, 1))
+all.equal(th2p(p2th(p_test)), p_test)
+```
+
+# Estimateur de Kaplan–Meier
+
+`km_weights` renvoie les sauts de l'estimateur de Kaplan–Meier de $F$. Il
+fonctionne sur toute la droite réelle (valeurs négatives comprises), ce qui
+n'est pas toujours le cas des fonctions de `survival`.
+
+* En cas d'ex-aequo, les événements sont placés avant les censures.
+* Si la plus grande observation est censurée, la masse manquante y est
+  reportée (correction d'Efron, 1967).
+* D'après Satten & Datta (2001), $\sum_j w_j e^{itx_j}$ est exactement la FC
+  empirique pondérée par l'inverse de la probabilité de censure (IPCW).
+
+```{r km}
+km_weights <- function(y, d) {
+  o <- order(y, -d); y <- y[o]; d <- d[o]; n <- length(y)
+  S <- cumprod(1 - d / (n:1))
+  w <- c(1, S[-n]) - S
+  if (d[n] == 0) w[n] <- w[n] + S[n]       # redistribution d'Efron (1967)
+  keep <- w > 0
+  list(x = y[keep], w = w[keep])
+}
+```
+
+```{r test-km}
+set.seed(3)
+y <- rnorm(10)
+## Sans censure : poids tous égaux à 1/n
+all.equal(km_weights(y, rep(1, 10))$w, rep(0.1, 10))
+## Avec censure : la masse totale reste égale à 1
+d <- c(1, 0, 1, 1, 0, 1, 1, 0, 1, 0); sum(km_weights(y, d)$w)
+```
+
+# Estimateurs de la fonction caractéristique
+
+On définit quatre estimateurs de $\phi(t)$ :
+
+1. **FC empirique pondérée** `cf_weighted` : poids $1/n$ (FC empirique
+   classique) ou sauts de Kaplan–Meier (FC KM/IPCW, section 4.1).
+2. **FC à noyau** `cf_kernel`. Le code d'origine calculait
+   $\int e^{itx}\hat f_h(x)\,dx$ par intégration numérique. Or elle vaut
+   exactement $\hat\phi_n(t)\,\phi_K(ht)$, soit $\hat\phi_n(t)\,e^{-h^2t^2/2}$
+   pour un noyau gaussien (équation (4.4)). Le noyau ne fait que **réduire le
+   module** de la FC, ce qui pousse $\hat\alpha$ vers 2. On la garde seulement
+   pour comparaison.
+3. **FC de Bernstein (–Kaplan–Meier)** `cf_bernstein`. On utilise la
+   représentation en mélange de lois Bêta (proposition 5.1) :
+   $$\hat\phi^{B}(t) = \sum_j w_j\,\mathbb E\big[e^{itQ(V_j)}\big],\qquad
+     V_j\sim\mathrm{Beta}(k_j, m+1-k_j),\quad k_j=\lceil m\,T(x_j)\rceil.$$
+   L'espérance est calculée par la règle du point milieu sur `G` quantiles
+   de la loi Bêta, une seule fois par valeur distincte de $k_j$. La
+   transformation par défaut est la fonction de répartition de Cauchy, adaptée
+   aux queues lourdes (remarque 5.2). Les données doivent être standardisées
+   au préalable.
+4. La fonction `eta0` intervient dans la partie imaginaire de $\log\phi$
+   (équation (2.4)).
+
+```{r cf-estimators}
+## FC empirique pondérée (poids 1/n ou sauts KM)
+cf_weighted <- function(x, w, t) colSums(w * exp(1i * outer(x, t)))
+
+## FIX: forme fermée de la FC à noyau gaussien (au lieu d'intégrales numériques)
+cf_kernel <- function(x, w, t, h) cf_weighted(x, w, t) * exp(-(h * t)^2 / 2)
+
+## FC de Bernstein(-KM) par mélange de lois Bêta
+cf_bernstein <- function(x, w, t, m = length(x),
+                         Tfun = pcauchy, Qfun = qcauchy, G = 200) {
+  u  <- Tfun(x)
+  k  <- pmin(pmax(ceiling(m * u), 1), m)
+  ks <- sort(unique(k)); K <- length(ks)
+  g  <- (seq_len(G) - 0.5) / G                         # points milieux des quantiles
+  V  <- matrix(qbeta(rep(g, each = K), rep(ks, G), rep(m + 1 - ks, G)), nrow = K)
+  V  <- pmin(pmax(V, 1e-12), 1 - 1e-12)
+  XV <- Qfun(V)
+  A  <- vapply(t, function(tt) rowMeans(exp(1i * tt * XV)), complex(K))
+  if (K == 1) A <- matrix(A, nrow = 1)
+  wk <- tapply(w, factor(k, levels = ks), sum)
+  colSums(as.numeric(wk) * A)
+}
+
+## Fonction eta de la partie imaginaire S0
+eta0 <- function(u, alpha, gamma, eps = 0.05) {
+  if (abs(alpha - 1) < eps) {
+    y <- (2 / pi) * u * log(gamma * abs(u)); y[u == 0] <- 0
+  } else {
+    y <- tan(pi * alpha / 2) * sign(u) *
+      ((abs(gamma * u) - abs(gamma * u)^alpha) / (gamma^alpha))
+  }
+  y
+}
+```
+
+**Test de contrôle.** On compare les quatre estimateurs à la vraie FC sur un
+échantillon de taille 1 000 censuré à environ 25 %. On observe trois choses :
+
+* la FC « naïve » (qui ignore la censure) est biaisée ;
+* la FC Kaplan–Meier et sa version Bernstein sont proches de la vérité ;
+* la FC à noyau a un module trop petit.
+
+```{r test-cf}
+set.seed(4)
+n <- 1000; x <- rstab(n, p_test)
+cc <- 1.5 + rcauchy(n); yobs <- pmin(x, cc); dobs <- as.numeric(x <= cc)
+cat("Taux de censure :", mean(dobs == 0), "\n")
+tt <- seq(0.1, 1.5, length.out = 15)
+kw <- km_weights(yobs, dobs)
+est <- list(
+  vraie     = cf_stable(tt, p_test),
+  naive     = cf_weighted(yobs, rep(1 / n, n), tt),
+  KM        = cf_weighted(kw$x, kw$w, tt),
+  Bernstein = cf_bernstein(kw$x, kw$w, tt, m = n),   # p_test a delta=0, gamma=1 : déjà standardisé
+  noyau     = cf_kernel(kw$x, kw$w, tt, h = bw.SJ(yobs)))
+matplot(tt, sapply(est, Mod), type = "l", lty = 1:5, lwd = 2, col = 1:5,
+        xlab = "t", ylab = "|phi(t)|", main = "Module des estimateurs de la FC")
+legend("topright", names(est), lty = 1:5, col = 1:5, lwd = 2, bty = "n")
+```
+
+# Régression sur la fonction caractéristique
+
+La méthode de Koutrouvelis (1980), utilisée par Hajjaji et al. (2025),
+exploite deux linéarisations de la FC $S_0$ (équations (2.3)–(2.4)) :
+
+$$\log\big(-\log|\phi(t)|\big) = \alpha\log\gamma + \alpha\log t, \qquad
+  \arg\phi(t) = \delta t - \beta\gamma^\alpha\eta_0(t;\alpha,\gamma).$$
+
+La première régression donne $(\alpha,\gamma)$, la seconde $(\beta,\delta)$.
+Chacune est refaite avec des poids estimés à partir des résidus.
+
+Corrections par rapport au code d'origine :
+
+* `FIX:` la seconde régression pondérée utilisait la variable globale `u1` au
+  lieu de l'argument `u` ;
+* `FIX:` les poids pouvaient être négatifs, ils sont maintenant minorés ;
+* si $\hat\alpha = 2$, $\beta$ n'est pas identifié : on le fixe à 0 et on
+  n'estime que $\delta$.
+
+`fit_cf` enchaîne les étapes suivantes :
+
+1. standardisation des données par la médiane et le demi-écart interquartile.
+   `stable_fit_init` (McCulloch) n'est plus utilisé ici : il échoue sur des
+   données à valeurs entières où l'écart interquartile est nul, ce qui arrive
+   pour l'intervalle sériel. Si l'écart interquartile est nul, on se replie
+   sur la MAD, puis l'écart-type ;
+2. calcul de la FC selon `method` ;
+3. régression ;
+4. retour à l'échelle d'origine grâce à la propriété de position–échelle de $S_0$.
+
+Les valeurs possibles de `method` sont :
+
+* `"naive"` : FC empirique, censure ignorée ;
+* `"km"` : FC Kaplan–Meier ;
+* `"bkm"` : FC de Bernstein–Kaplan–Meier ;
+* `"kernel"` : FC à noyau, pour comparaison seulement.
+
+```{r cf-regression}
+cf_regression <- function(phi, u) {
+  safe_w <- function(fit) {
+    fv <- fitted(lm(abs(resid(fit)) ~ fitted(fit)))
+    1 / pmax(fv, 1e-6)^2
+  }
+  md <- pmin(pmax(Mod(phi), 1e-10), 1 - 1e-10)
+  z <- log(-log(md)); v <- log(abs(u))
+  a1 <- lm(z ~ v); a1 <- lm(z ~ v, weights = safe_w(a1))
+  alpha <- min(max(unname(coef(a1)[2]), 0.1), 2)
+  gam <- exp(unname(coef(a1)[1]) / alpha)
+  y3 <- Arg(phi)
+  v3 <- -gam^alpha * eta0(u, alpha, gam)
+  if (abs(alpha - 2) < 1e-8) {                # beta non identifié en alpha = 2
+    a3 <- lm(y3 ~ 0 + u); beta <- 0; delta <- unname(coef(a3)[1])
+  } else {
+    a3 <- lm(y3 ~ 0 + v3 + u); a3 <- lm(y3 ~ 0 + v3 + u, weights = safe_w(a3))
+    beta <- min(max(unname(coef(a3)[1]), -1), 1); delta <- unname(coef(a3)[2])
+  }
+  c(alpha, beta, gam, delta)
+}
+
+fit_cf <- function(y, d = rep(1, length(y)), method = "km",
+                   u = seq(0.1, 1, length.out = 10), m = NULL) {
+  ## FIX (données à valeurs entières / nombreux ex-aequo) : stable_fit_init()
+  ## échoue quand l'écart interquartile est nul ("interquartile range is 0"),
+  ## ce qui donnait gamma0 = 0, des z infinis et lm() sur 0 cas.
+  ## La standardisation n'a besoin que d'une position et d'une échelle
+  ## robustes : médiane et demi-écart interquartile, avec repli sur la MAD,
+  ## l'écart-type puis 1.
+  d0 <- median(y)
+  g0 <- IQR(y) / 2
+  if (!is.finite(g0) || g0 <= 0) g0 <- mad(y)
+  if (!is.finite(g0) || g0 <= 0) g0 <- sd(y)
+  if (!is.finite(g0) || g0 <= 0) g0 <- 1
+  z <- (y - d0) / g0
+  n <- length(z)
+  if (method %in% c("naive", "kernel")) {
+    x <- z; w <- rep(1 / n, n)
+  } else {
+    kw <- km_weights(z, d); x <- kw$x; w <- kw$w
+  }
+  phi <- switch(method,
+    naive  = cf_weighted(x, w, u),
+    km     = cf_weighted(x, w, u),
+    bkm    = cf_bernstein(x, w, u, m = if (is.null(m)) n else m),
+    kernel = cf_kernel(x, w, u, h = bw.SJ(x)))
+  p <- tryCatch(cf_regression(phi, u), error = function(e) rep(NA_real_, 4))
+  out <- c(p[1], p[2], p[3] * g0, p[4] * g0 + d0)
+  ## repli si la régression échoue (échantillon trop petit ou dégénéré)
+  if (any(!is.finite(out)) || out[3] <= 0) out <- c(1.8, 0, g0, d0)
+  out
+}
+```
+
+```{r test-fitcf}
+## Sur l'échantillon censuré précédent (vraie valeur : 1.5, 0.5, 1, 0)
+res <- t(sapply(c("naive", "km", "bkm", "kernel"), function(m) fit_cf(yobs, dobs, method = m)))
+colnames(res) <- c("alpha", "beta", "gamma", "delta")
+round(rbind(vrai = p_test, res), 3)
+```
+
+# Maximum de vraisemblance censuré (une composante)
+
+`fit_ml_cens` maximise $\sum_i w_i\,\ell_i(\theta)$ par Nelder–Mead sur
+l'échelle non contrainte. Les poids $w_i$ servent dans l'étape M de l'EM
+(poids $\tau_{ik}$) ; pour un ajustement simple, $w_i = 1$.
+
+```{r ml}
+fit_ml_cens <- function(lo, hi, w = rep(1, length(lo)), init, maxit = 300) {
+  f <- function(th) {
+    v <- -sum(w * loglik_obs(th2p(th), lo, hi))
+    if (!is.finite(v)) 1e100 else v
+  }
+  opt <- optim(p2th(init), f, method = "Nelder-Mead", control = list(maxit = maxit))
+  th2p(opt$par)
+}
+```
+
+```{r test-ml}
+lo <- yobs; hi <- ifelse(dobs == 1, yobs, Inf)
+ml <- fit_ml_cens(lo, hi, init = fit_cf(yobs, dobs, "km"))
+round(rbind(vrai = p_test, ML_censure = ml), 3)
+```
+
+# Initialisation d'un mélange
+
+`init_mix` :
+
+1. applique les k-means aux points milieux (ou aux valeurs observées pour les
+   censures à droite) ;
+2. ajuste chaque groupe par régression sur la FC (Kaplan–Meier s'il contient
+   des censures) ;
+3. ordonne les composantes par $\delta$ croissant, ce qui fixe l'identification
+   des étiquettes.
+
+```{r init}
+init_mix <- function(lo, hi, K = 2, seed = 1) {
+  set.seed(seed)
+  mid <- ifelse(is.infinite(hi), lo, (lo + hi) / 2)
+  cl <- kmeans(mid, centers = K, nstart = 10)$cluster
+  P <- t(sapply(seq_len(K), function(k) {
+    idx <- cl == k
+    d <- as.numeric(is.finite(hi[idx]))   # intervalles : points milieux utilisés comme valeurs
+    fit_cf(mid[idx], d, method = if (all(d == 1)) "naive" else "km")
+  }))
+  o <- order(P[, 4])
+  list(w = as.numeric(table(factor(cl, levels = 1:K)))[o] / length(lo), P = P[o, , drop = FALSE])
+}
+
+relabel <- function(w, P) { o <- order(P[, 4]); list(w = w[o], P = P[o, , drop = FALSE]) }
+```
+
+# Algorithme EM pour mélanges censurés
+
+Ici, seules les **étiquettes** $Z_i$ sont traitées comme manquantes (section 6.1) :
+
+* **étape E** : $\tau_{ik}\propto\pi_k L_k(\text{obs}_i)$, où $L_k$ vaut $f_k$,
+  $S_k$ ou $F_k(r)-F_k(\ell)$ selon le type d'observation ;
+* **étape M** : $\pi_k = \bar\tau_{\cdot k}$, puis maximum de vraisemblance
+  censuré pondéré par $\tau_{\cdot k}$ pour chaque composante.
+
+Il n'y a aucune espérance tronquée à calculer. `FIX:` l'« EM » d'origine tirait
+les étiquettes au hasard (EM stochastique) et ignorait la censure.
+
+```{r em}
+em_mix_cens <- function(lo, hi, K = 2, init = NULL, maxit = 100, tol = 1e-6,
+                        verbose = FALSE) {
+  if (is.null(init)) init <- init_mix(lo, hi, K)
+  w <- init$w; P <- init$P; ll_old <- -Inf
+  for (it in seq_len(maxit)) {
+    L <- matrix(sapply(seq_len(K), function(k) log(w[k]) + loglik_obs(P[k, ], lo, hi)), ncol = K)
+    lse <- apply(L, 1, logsumexp); tau <- exp(L - lse); ll <- sum(lse)
+    if (verbose) cat(sprintf("EM it %3d  loglik = %.4f\n", it, ll))
+    if (abs(ll - ll_old) < tol * abs(ll)) break
+    ll_old <- ll
+    w <- colMeans(tau)
+    for (k in seq_len(K)) P[k, ] <- fit_ml_cens(lo, hi, tau[, k], P[k, ])
+  }
+  r <- relabel(w, P)
+  list(w = r$w, P = r$P, loglik = ll, iter = it)
+}
+```
+
+# EM stochastique avec imputation (SEM)
+
+À chaque itération (algorithme 1 de l'article) :
+
+1. **étape S** : on tire les étiquettes $Z_i$ selon $\tau_{i\cdot}$, puis les
+   valeurs censurées $X_i$ selon la loi tronquée de la composante $Z_i$ ;
+2. **étape M** sur les données complétées : régression sur la FC (`"cf"`) ou
+   maximum de vraisemblance complet (`"ml"`) ;
+3. réétiquetage des composantes par $\delta$ croissant.
+
+Les itérations d'un SEM ne convergent pas vers un point fixe : l'estimateur est
+la **moyenne des itérations après la période de chauffe** (`burn`). Une
+composante qui compte moins de `min_size` points conserve ses paramètres
+précédents.
+
+```{r sem}
+sem_mix_cens <- function(lo, hi, K = 2, init = NULL, iters = 150, burn = 50,
+                         mstep = c("cf", "ml"), min_size = 15) {
+  mstep <- match.arg(mstep)
+  if (is.null(init)) init <- init_mix(lo, hi, K)
+  w <- init$w; P <- init$P; n <- length(lo)
+  ex <- lo == hi; x <- ifelse(ex, lo, ifelse(is.infinite(hi), lo, (lo + hi) / 2))
+  W <- matrix(NA, iters, K); PP <- array(NA, c(iters, K, 4))
+  for (it in seq_len(iters)) {
+    L <- matrix(sapply(seq_len(K), function(k) log(w[k]) + loglik_obs(P[k, ], lo, hi)), ncol = K)
+    pr <- exp(L - apply(L, 1, logsumexp))
+    z <- apply(pr, 1, function(q) sample.int(K, 1, prob = q))
+    for (k in seq_len(K)) {
+      idx <- which(!ex & z == k)
+      if (length(idx)) x[idx] <- rtrunc_stab(lo[idx], hi[idx], P[k, ])
+    }
+    w <- tabulate(z, K) / n
+    for (k in seq_len(K)) {
+      if (sum(z == k) >= min_size) {
+        P[k, ] <- if (mstep == "cf") fit_cf(x[z == k], method = "naive") else
+                  stable_fit_mle(x[z == k], parametrization = 0L)
+      }
+    }
+    r <- relabel(w, P); w <- r$w; P <- r$P
+    W[it, ] <- w; PP[it, , ] <- P
+  }
+  keep <- (burn + 1):iters
+  list(w = colMeans(W[keep, , drop = FALSE]),
+       P = apply(PP[keep, , , drop = FALSE], c(2, 3), mean),
+       chain_w = W, chain_P = PP)
+}
+```
+
+# Inférence bayésienne par augmentation de données
+
+Lois a priori :
+
+* $\pi\sim\mathrm{Dir}(1,\dots,1)$ ;
+* $\alpha_k\sim\mathcal U(0,2)$ et $\beta_k\sim\mathcal U(-1,1)$ ;
+* $\gamma_k\sim\mathrm{IG}(1,1)$ ;
+* $\delta_k\sim\mathcal N(\mu_0,s_0^2)$, avec $\mu_0$ la médiane des données et
+  $s_0$ égal à 5 fois leur écart absolu médian (MAD).
+
+On impose de plus la contrainte $\delta_1<\dots<\delta_K$ contre le changement
+d'étiquettes. Un tour d'échantillonneur de Gibbs comprend quatre étapes :
+
+a. imputation des valeurs censurées sachant les étiquettes ;
+b. tirage des étiquettes sachant les valeurs complètes ;
+c. tirage des poids dans la loi de Dirichlet ;
+d. pour chaque composante, un pas de Metropolis–Hastings à marche aléatoire
+   sur l'échelle non contrainte.
+
+L'échelle de proposition est adaptée pendant la chauffe pour viser un taux
+d'acceptation d'environ 25 %.
+
+`FIX:` le rapport de Metropolis–Hastings est maintenant calculé sur l'échelle
+logarithmique et inclut le jacobien de la reparamétrisation. Le code d'origine
+multipliait des densités remises à l'échelle (risque de dépassement de
+capacité vers 0) et ne corrigeait pas les propositions normales tronquées.
+
+```{r bayes}
+rdirichlet1 <- function(a) { g <- rgamma(length(a), a); g / sum(g) }
+
+## log a priori sur p + log|jacobien| de la transformation th -> p
+log_prior_th <- function(th, pr) {
+  p <- th2p(th)
+  lp <- log(0.5) + log(0.5) +
+    (pr$a0 * log(pr$b0) - lgamma(pr$a0) - (pr$a0 + 1) * log(p[3]) - pr$b0 / p[3]) +
+    dnorm(p[4], pr$mu0, pr$s0, log = TRUE)
+  lj <- log(2) + plogis(th[1], log.p = TRUE) + plogis(-th[1], log.p = TRUE) +
+    log(1 - tanh(th[2])^2) + th[3]
+  lp + lj
+}
+
+bayes_mix_cens <- function(lo, hi, K = 2, init = NULL, n_iter = 4000, burn = 1500,
+                           prior = NULL, sd0 = c(0.15, 0.15, 0.08, 0.08)) {
+  n <- length(lo); ex <- lo == hi
+  if (is.null(init)) init <- init_mix(lo, hi, K)
+  mid <- ifelse(is.infinite(hi), lo, (lo + hi) / 2)
+  if (is.null(prior)) prior <- list(a = rep(1, K), a0 = 1, b0 = 1,
+                                    mu0 = median(mid), s0 = 5 * mad(mid))
+  w <- init$w; TH <- t(apply(init$P, 1, p2th))
+  x <- mid; sdk <- matrix(sd0, K, 4, byrow = TRUE); acc <- numeric(K)
+  out_w <- matrix(NA, n_iter, K); out_P <- array(NA, c(n_iter, K, 4))
+  for (it in seq_len(n_iter)) {
+    P <- t(apply(TH, 1, th2p))
+    ## (a) imputation des valeurs censurées (premier passage : étiquettes tirées du mélange)
+    if (it == 1) {
+      L <- matrix(sapply(seq_len(K), function(k) log(w[k]) + loglik_obs(P[k, ], lo, hi)), ncol = K)
+      z <- apply(exp(L - apply(L, 1, logsumexp)), 1, function(q) sample.int(K, 1, prob = q))
+    }
+    for (k in seq_len(K)) {
+      idx <- which(!ex & z == k)
+      if (length(idx)) x[idx] <- rtrunc_stab(lo[idx], hi[idx], P[k, ])
+    }
+    ## (b) étiquettes | x, theta, pi
+    L <- matrix(sapply(seq_len(K), function(k) log(w[k]) + log(dstab(x, P[k, ]))), ncol = K)
+    z <- apply(exp(L - apply(L, 1, logsumexp)), 1, function(q) sample.int(K, 1, prob = q))
+    ## (c) poids | étiquettes
+    w <- rdirichlet1(prior$a + tabulate(z, K))
+    ## (d) Metropolis-Hastings pour chaque composante
+    for (k in seq_len(K)) {
+      xk <- x[z == k]
+      prop <- TH[k, ] + rnorm(4, 0, sdk[k, ])
+      pk <- th2p(prop)
+      ordered_ok <- (k == 1 || pk[4] > th2p(TH[k - 1, ])[4]) &&
+                    (k == K || pk[4] < th2p(TH[k + 1, ])[4])
+      if (ordered_ok) {
+        lr <- sum(log(dstab(xk, pk))) + log_prior_th(prop, prior) -
+              sum(log(dstab(xk, th2p(TH[k, ])))) - log_prior_th(TH[k, ], prior)
+        if (is.finite(lr) && log(runif(1)) < lr) { TH[k, ] <- prop; acc[k] <- acc[k] + 1 }
+      }
+    }
+    ## adaptation de l'échelle de proposition pendant la chauffe
+    if (it <= burn && it %% 50 == 0) {
+      sdk <- sdk * exp(acc / 50 - 0.25); acc[] <- 0
+    }
+    out_w[it, ] <- w; out_P[it, , ] <- t(apply(TH, 1, th2p))
+  }
+  keep <- (burn + 1):n_iter
+  list(w = colMeans(out_w[keep, , drop = FALSE]),
+       P = apply(out_P[keep, , , drop = FALSE], c(2, 3), mean),
+       chain_w = out_w, chain_P = out_P)
+}
+```
+
+## Démonstration sur un mélange simulé
+
+On reprend le plan de Hajjaji et al. (2025) :
+
+* $\pi_1 = 0.6$ ;
+* composante 1 : $\theta_1 = (1.2, 0.5, 1, -4.25)$ ;
+* composante 2 : $\theta_2 = (1.2, -0.5, 0.5, 0.3)$.
+
+L'échantillon est de taille $n = 500$, avec environ 20 % de censure à droite
+de type Cauchy. On compare quatre ajustements :
+
+* EM naïf, qui traite les valeurs observées comme exactes ;
+* EM censuré ;
+* SEM ;
+* échantillonneur bayésien (chaîne courte).
+
+```{r demo-mix}
+W0 <- c(0.6, 0.4)
+P0 <- rbind(c(1.2, 0.5, 1.0, -4.25), c(1.2, -0.5, 0.5, 0.3))
+rmix <- function(n) { z <- sample.int(2, n, TRUE, W0)
+  x <- numeric(n); for (k in 1:2) x[z == k] <- rstab(sum(z == k), P0[k, ]); x }
+
+set.seed(5)
+xm <- rmix(500)
+## calibration de la localisation de la censure pour ~20 %
+xr <- rmix(2e4); er <- rcauchy(2e4)
+mu_c <- uniroot(function(mu) mean(xr > mu + er) - 0.20, c(-50, 50))$root
+cm <- mu_c + rcauchy(500); ym <- pmin(xm, cm); dm <- as.numeric(xm <= cm)
+lo_m <- ym; hi_m <- ifelse(dm == 1, ym, Inf)
+cat("Taux de censure :", mean(dm == 0), "\n")
+
+t0 <- Sys.time()
+fit_naif <- em_mix_cens(ym, ym, 2)
+fit_em   <- em_mix_cens(lo_m, hi_m, 2)
+fit_sem  <- sem_mix_cens(lo_m, hi_m, 2, iters = 100, burn = 40)
+fit_bay  <- bayes_mix_cens(lo_m, hi_m, 2, n_iter = 1500, burn = 500)
+Sys.time() - t0
+
+tab <- function(f) c(pi1 = f$w[1], setNames(as.vector(t(f$P)),
+        paste0(rep(c("alpha", "beta", "gamma", "delta"), 2), rep(1:2, each = 4))))
+round(rbind(vrai = tab(list(w = W0, P = P0)), EM_naif = tab(fit_naif),
+            EM_censure = tab(fit_em), SEM = tab(fit_sem), Bayes = tab(fit_bay)), 3)
+```
+
+```{r demo-mix-plot}
+xx <- seq(-10, 8, length.out = 400)
+plot(xx, dmix(xx, W0, P0), type = "l", lwd = 3, xlab = "x", ylab = "densité",
+     main = "Mélange simulé (20 % de censure)")
+fits_demo <- list(`EM naïf` = fit_naif, `EM censuré` = fit_em, SEM = fit_sem, Bayes = fit_bay)
+for (j in seq_along(fits_demo)) lines(xx, dmix(xx, fits_demo[[j]]$w, fits_demo[[j]]$P), col = j + 1, lwd = 2, lty = j + 1)
+legend("topright", c("vraie", names(fits_demo)), col = 1:5, lty = 1:5, lwd = 2, bty = "n")
+```
+
+Diagnostic des chaînes bayésiennes, sur $\alpha_1$ et $\pi_1$ :
+
+```{r demo-trace, fig.height=3.5}
+par(mfrow = c(1, 2))
+plot(fit_bay$chain_P[, 1, 1], type = "l", ylab = expression(alpha[1]), xlab = "itération")
+abline(v = 500, lty = 2, col = "red")
+plot(fit_bay$chain_w[, 1], type = "l", ylab = expression(pi[1]), xlab = "itération")
+abline(v = 500, lty = 2, col = "red")
+```
+
+# Critères d'information, nombre de reproduction, tableaux LaTeX
+
+* **AIC/BIC.** `FIX:` une composante avec $\alpha_k = 2$ (loi gaussienne) n'a
+  que 3 paramètres libres, car $\beta_k$ n'est pas identifié. De plus,
+  $\alpha = 2$ est un point du bord de l'espace des paramètres, donc AIC et BIC
+  n'y sont qu'indicatifs (Self & Liang, 1987).
+* **$R_t$.** `FIX:` la fonction `RT()` d'origine sommait aussi sur les
+  incidences *futures* ($j > i$), et `est_r0_ml()` recevait les intervalles
+  sériels au lieu de la série d'incidence. On utilise ici l'équation de
+  renouvellement avec une fenêtre glissante de 7 jours (Cori et al., 2013).
+  Les poids $w_s$ sont la loi ajustée de l'intervalle sériel discrétisée sur
+  $s = 1,\dots,30$ ; la masse négative est supprimée puis les poids sont
+  renormalisés.
+* **`write_tex_table`** écrit un `tabular` au format booktabs, lu par `main.tex`.
+
+```{r utils}
+n_free_par <- function(P, tol = 1e-3) {
+  K <- nrow(P); (K - 1) + sum(ifelse(abs(P[, 1] - 2) < tol, 3, 4))
+}
+mix_loglik_obs <- function(w, P, lo, hi) {
+  L <- matrix(sapply(seq_len(nrow(P)), function(k) log(w[k]) + loglik_obs(P[k, ], lo, hi)),
+              ncol = nrow(P))
+  sum(apply(L, 1, logsumexp))
+}
+info_crit <- function(w, P, lo, hi) {
+  ll <- mix_loglik_obs(w, P, lo, hi); k <- n_free_par(P); n <- length(lo)
+  c(loglik = ll, npar = k, AIC = -2 * ll + 2 * k, BIC = -2 * ll + log(n) * k)
+}
+
+si_weights <- function(w, P, smax = 30) {
+  s <- 1:smax
+  pm <- sapply(s, function(j) sum(sapply(seq_along(w), function(k)
+    w[k] * (pstab(j + 0.5, P[k, ]) - pstab(j - 0.5, P[k, ])))))
+  pm / sum(pm)
+}
+Rt_renewal <- function(inc, ws, window = 7) {
+  Tn <- length(inc); S <- length(ws); lam <- rep(NA, Tn)
+  for (t in 2:Tn) { s <- 1:min(S, t - 1); lam[t] <- sum(inc[t - s] * ws[s]) }
+  R <- rep(NA, Tn)
+  for (t in (window + 1):Tn) {
+    idx <- (t - window + 1):t
+    R[t] <- sum(inc[idx]) / sum(lam[idx])        # estimateur ponctuel de Cori et al. (2013)
+  }
+  R
+}
+
+write_tex_table <- function(df, file, digits = 3, align = NULL) {
+  if (is.null(align)) align <- paste0("l", strrep("r", ncol(df) - 1))
+  fmt <- function(v) if (is.numeric(v)) formatC(v, format = "f", digits = digits) else as.character(v)
+  body <- do.call(cbind, lapply(df, fmt))
+  esc <- function(s) gsub("_", "\\\\_", s)
+  body[] <- esc(body)
+  lines <- c(sprintf("\\begin{tabular}{%s}", align), "\\toprule",
+             paste(paste(esc(names(df)), collapse = " & "), "\\\\"), "\\midrule",
+             apply(body, 1, function(r) paste(paste(r, collapse = " & "), "\\\\")),
+             "\\bottomrule", "\\end{tabular}")
+  dir.create(dirname(file), showWarnings = FALSE, recursive = TRUE)
+  writeLines(lines, file)
+}
+```
+
+```{r test-ic}
+## Comparaison EM naïf / EM censuré sur la vraisemblance censurée du mélange de démonstration
+rbind(EM_naif = info_crit(fit_naif$w, fit_naif$P, lo_m, hi_m),
+      EM_censure = info_crit(fit_em$w, fit_em$P, lo_m, hi_m))
+```
+
+# Étude de simulation (section 8 de l'article)
+
+## Réglages
+
+```{r sim-settings, eval=params$run_simulation}
+if (params$mode == "complet") {
+  R_REP <- 200; R_REP_MIX <- 100; R_REP_BAY <- 30; NS <- c(250, 500, 1000)
+  BAY_ITER <- 3000; BAY_BURN <- 1000
+} else {                                   # mode rapide : vérifie que tout tourne
+  R_REP <- 10;  R_REP_MIX <- 4;   R_REP_BAY <- 2;  NS <- c(250, 500)
+  BAY_ITER <- 600;  BAY_BURN <- 200
+}
+CENS   <- c(0, 0.15, 0.30)
+U_GRID <- seq(0.1, 1, length.out = 10)
+CORES  <- if (.Platform$OS.type == "windows") 1L else max(1L, detectCores() - 1L)
+RNGkind("L'Ecuyer-CMRG"); set.seed(2026)
+cat("Mode :", params$mode, "| cœurs :", CORES, "\n")
+```
+
+**Mécanisme de censure.** $C = \mu_c + s_c\,\varepsilon$ avec $\varepsilon$ de
+loi de Cauchy, indépendant de $X$. L'indice de queue de $C$ (égal à 1) est
+inférieur à tous les $\alpha$ utilisés, ce qui garantit la condition
+$\int dF/G < \infty$ (remarque 4.2). $\mu_c$ est calibré par Monte-Carlo
+(`uniroot`) pour obtenir le taux de censure visé.
+
+```{r sim-tools, eval=params$run_simulation}
+calib_mu_c <- function(rate, rX, s_c = 1, N = 2e5) {
+  if (rate == 0) return(Inf)
+  x <- rX(N); e <- rcauchy(N)
+  uniroot(function(mu) mean(x > mu + s_c * e) - rate, c(-1e3, 1e3))$root
+}
+censor <- function(x, mu_c, s_c = 1) {
+  if (is.infinite(mu_c)) return(list(lo = x, hi = x, y = x, d = rep(1, length(x))))
+  cc <- mu_c + s_c * rcauchy(length(x)); y <- pmin(x, cc); d <- as.numeric(x <= cc)
+  list(lo = y, hi = ifelse(d == 1, y, Inf), y = y, d = d)
+}
+## Biais et RMSE (réplications en échec écartées)
+summ <- function(est, truth) {
+  est <- do.call(rbind, est); ok <- stats::complete.cases(est); est <- est[ok, , drop = FALSE]
+  b <- colMeans(est) - truth; r <- sqrt(colMeans(sweep(est, 2, truth)^2))
+  data.frame(stat = c("Bias", "RMSE"), rbind(b, r), check.names = FALSE, row.names = NULL)
+}
+safe <- function(expr) tryCatch(expr, error = function(e) rep(NA_real_, 4))
+```
+
+## Étude A : une seule composante, censure à droite
+
+Deux scénarios : A1, $S_0(1.5, 0.5, 1, 0)$, et A2, $S_0(1.2, -0.3, 2, 5)$. On
+compare quatre estimateurs : régression sur la FC naïve, sur la FC
+Kaplan–Meier et sur la FC de Bernstein–KM, et maximum de vraisemblance censuré.
+
+```{r studyA, eval=params$run_simulation}
+PARS_A <- list(A1 = c(1.5, 0.5, 1, 0), A2 = c(1.2, -0.3, 2, 5))
+resA <- list()
+for (sc in names(PARS_A)) {
+  p0 <- PARS_A[[sc]]
+  for (cr in CENS) {
+    mu_c <- calib_mu_c(cr, function(N) rstab(N, p0), s_c = p0[3])
+    for (n in NS) {
+      one <- function(r) {
+        x <- rstab(n, p0); ob <- censor(x, mu_c, s_c = p0[3])
+        list(naive = safe(fit_cf(ob$y, method = "naive", u = U_GRID)),
+             km    = safe(fit_cf(ob$y, ob$d, method = "km", u = U_GRID)),
+             bkm   = safe(fit_cf(ob$y, ob$d, method = "bkm", u = U_GRID)),
+             ml    = safe(fit_ml_cens(ob$lo, ob$hi,
+                                      init = fit_cf(ob$y, ob$d, "km", u = U_GRID))),
+             rate  = mean(ob$d == 0))
+      }
+      out <- mclapply(seq_len(R_REP), one, mc.cores = CORES)
+      for (meth in c("naive", "km", "bkm", "ml")) {
+        s <- summ(lapply(out, `[[`, meth), p0)
+        resA[[length(resA) + 1]] <- data.frame(Scenario = sc, n = n,
+          Cens = sprintf("%.0f%%", 100 * mean(sapply(out, `[[`, "rate"))),
+          Method = meth, s, check.names = FALSE)
+      }
+      cat("Étude A", sc, "censure", cr, "n", n, "terminée\n")
+    }
+  }
+}
+resA <- do.call(rbind, resA)
+names(resA)[6:9] <- c("$\\alpha$", "$\\beta$", "$\\gamma$", "$\\delta$")
+saveRDS(resA, "tables/sim_A.rds")
+for (sc in names(PARS_A)) for (st in c("Bias", "RMSE")) {
+  tab <- resA[resA$Scenario == sc & resA$stat == st, c(2:4, 6:9)]
+  write_tex_table(tab, sprintf("tables/sim_A_%s_%s.tex", sc, st), align = "rllrrrr")
+}
+tab
+```
+
+```{r studyA-show, eval=params$run_simulation}
+showA <- resA; names(showA)[6:9] <- c("alpha", "beta", "gamma", "delta")
+knitr::kable(showA[showA$Scenario == "A1", -1], digits = 3,
+             caption = "Étude A1 : biais et RMSE")
+```
+
+Visualisation : RMSE de $\hat\alpha$ en fonction du taux de censure (n maximal).
+
+```{r studyA-plot, eval=params$run_simulation, fig.height=3.5}
+par(mfrow = c(1, 2))
+for (sc in names(PARS_A)) {
+  d <- showA[showA$Scenario == sc & showA$stat == "RMSE" & showA$n == max(NS), ]
+  m <- tapply(d$alpha, list(d$Cens, d$Method), mean)
+  matplot(seq_len(nrow(m)), m, type = "b", pch = 1:4, lty = 1, xaxt = "n",
+          xlab = "taux de censure", ylab = "RMSE(alpha)", main = sc)
+  axis(1, at = seq_len(nrow(m)), labels = rownames(m))
+  legend("topleft", colnames(m), pch = 1:4, col = 1:4, bty = "n", cex = 0.8)
+}
+```
+
+## Étude B : mélange à deux composantes
+
+On reprend le plan du §9.1 avec $n = 1000$ et trois taux de censure (0, 15 et
+30 %). On compare l'EM naïf, l'EM censuré, le SEM avec étape M par
+régression sur la FC, et l'échantillonneur bayésien (moins de réplications,
+car il est lent). Outre le biais et la RMSE, on calcule la distance $L^1$
+entre la densité du mélange estimée et la vraie densité.
+
+```{r studyB, eval=params$run_simulation}
+xx <- seq(-10, 8, length.out = 400); f0 <- dmix(xx, W0, P0)
+L1   <- function(fit) if (is.null(fit)) NA else sum(abs(dmix(xx, fit$w, fit$P) - f0)) * diff(xx)[1]
+vec  <- function(fit) if (is.null(fit)) rep(NA, 9) else c(fit$w[1], t(fit$P))
+truthB <- c(W0[1], t(P0))
+nmB <- c("$\\pi_1$", paste0(rep(c("$\\alpha_", "$\\beta_", "$\\gamma_", "$\\delta_"), 2),
+                             rep(1:2, each = 4), "$"))
+resB <- list(); n <- 1000
+for (cr in CENS) {
+  mu_c <- calib_mu_c(cr, rmix, s_c = 1)
+  one <- function(r, bayes = FALSE) {
+    ob <- censor(rmix(n), mu_c)
+    sf <- function(e) tryCatch(e, error = function(err) NULL)
+    if (bayes) return(list(bayes = sf(bayes_mix_cens(ob$lo, ob$hi, 2, n_iter = BAY_ITER, burn = BAY_BURN))))
+    list(naive = sf(em_mix_cens(ob$y, ob$y, 2)),          # censure ignorée
+         em    = sf(em_mix_cens(ob$lo, ob$hi, 2)),
+         sem   = sf(sem_mix_cens(ob$lo, ob$hi, 2, mstep = "cf")))
+  }
+  out  <- mclapply(seq_len(R_REP_MIX), one, mc.cores = CORES)
+  outB <- mclapply(seq_len(R_REP_BAY), one, bayes = TRUE, mc.cores = CORES)
+  for (meth in c("naive", "em", "sem", "bayes")) {
+    src <- if (meth == "bayes") outB else out
+    fits <- lapply(src, `[[`, meth)
+    s <- summ(lapply(fits, vec), truthB)
+    names(s)[-1] <- nmB
+    resB[[length(resB) + 1]] <- data.frame(Cens = sprintf("%.0f%%", 100 * cr), Method = meth,
+      L1 = mean(sapply(fits, L1), na.rm = TRUE), s, check.names = FALSE)
+  }
+  cat("Étude B, censure", cr, "terminée\n")
+}
+resB <- do.call(rbind, resB); saveRDS(resB, "tables/sim_B.rds")
+for (st in c("Bias", "RMSE"))
+  write_tex_table(resB[resB$stat == st, -4], sprintf("tables/sim_B_%s.tex", st),
+                  align = paste0("ll", strrep("r", 10)))
+```
+
+```{r studyB-show, eval=params$run_simulation}
+showB <- resB; names(showB) <- gsub("[$\\\\]", "", names(showB))
+knitr::kable(showB[showB$stat == "RMSE", ], digits = 3, caption = "Étude B : RMSE et distance L1")
+```
+
+## Étude C : précision des estimateurs de la FC (degré de Bernstein $m$)
+
+Cette étude vérifie numériquement les théorèmes 5.3 et 5.4 de l'article. Ils
+prévoient que :
+
+* $n\times\mathrm{MSE}$ est le même pour la FC empirique (ou KM) et pour la FC
+  de Bernstein avec $m$ grand ;
+* sans censure, cette valeur est proche de $1-|\phi(t)|^2$ ;
+* la FC à noyau garde un biais supplémentaire.
+
+On compare $m = \sqrt n$, $m = n$ et $m = 4n$.
+
+```{r studyC, eval=params$run_simulation}
+p0 <- c(1.5, 0.5, 1, 0); tC <- c(0.25, 0.5, 1)
+resC <- list()
+for (cr in c(0, 0.30)) {
+  mu_c <- calib_mu_c(cr, function(N) rstab(N, p0))
+  for (n in NS) {
+    one <- function(r) {
+      ob <- censor(rstab(n, p0), mu_c)
+      kw <- km_weights(ob$y, ob$d)
+      ph <- cf_stable(tC, p0)
+      se <- function(est) mean(abs(est - ph)^2)          # moyenne sur les valeurs de t
+      zx <- (kw$x - p0[4]) / p0[3]                        # standardisation par les vraies valeurs
+      cfB <- function(m) exp(1i * tC * p0[4]) * cf_bernstein(zx, kw$w, tC * p0[3], m = m)
+      c("ECF"          = se(cf_weighted(kw$x, kw$w, tC)),
+        "Kernel"       = se(cf_kernel(kw$x, kw$w, tC, h = bw.SJ(ob$y))),
+        "B, m=sqrt(n)" = se(cfB(ceiling(sqrt(n)))),
+        "B, m=n"       = se(cfB(n)),
+        "B, m=4n"      = se(cfB(4 * n)))
+    }
+    M <- colMeans(do.call(rbind, mclapply(seq_len(R_REP), one, mc.cores = CORES)))
+    resC[[length(resC) + 1]] <- data.frame(Cens = sprintf("%.0f%%", 100 * cr), n = n,
+                                           t(n * M), check.names = FALSE)
+  }
+}
+resC <- do.call(rbind, resC); saveRDS(resC, "tables/sim_C.rds")
+write_tex_table(resC, "tables/sim_C.tex", align = "lrrrrrr")
+knitr::kable(resC, digits = 3, caption = "Étude C : n x MSE")
+cat("Valeur théorique sans censure, moyenne de 1 - |phi(t)|^2 :",
+    round(mean(1 - Mod(cf_stable(tC, p0))^2), 3), "\n")
+```
+
+```{r studyC-plot, eval=params$run_simulation}
+plotC <- function() {
+  par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+  for (cr in unique(resC$Cens)) {
+    d <- resC[resC$Cens == cr, ]
+    matplot(d$n, d[, -(1:2)], type = "b", pch = 1:5, lty = 1, log = "x",
+            xlab = "n", ylab = "n x MSE", main = paste("censure", cr))
+    legend("topright", names(d)[-(1:2)], pch = 1:5, col = 1:5, bty = "n", cex = 0.7)
+  }
+}
+plotC()                                             # affichage dans le notebook
+pdf("figures/sim_C.pdf", width = 7, height = 4); plotC(); invisible(dev.off())   # pour l'article
+```
+
+# Applications (section 9 de l'article)
+
+## Intervalle sériel (censure par intervalle)
+
+**Fichiers attendus dans `data/`** (ceux que vous avez fournis) :
+
+| Fichier | Contenu | Format des dates |
+|---|---|---|
+| `DONNEE.csv` | 77 paires infecteur–infecté : `ID ; x.lb ; x.ub ; y` | jj/mm/aaaa |
+| `SERIE.csv` | série quotidienne de Mayotte : `Date ; Nouveaux_cas ; <village>_casV ; <commune>_cas` | **mm/jj/aaaa** |
+| `Feuil2.csv` | tableau de bord début janvier 2022 : cas, incidence, R0 et intervalle de confiance par commune, âge, sexe | — |
+| `Feuil1.csv` | tableau de bord (incidence, positivité, scoring), en-tête à la ligne 34 | — |
+
+Dans `DONNEE.csv` :
+
+* `x.lb` et `x.ub` bornent la fenêtre dans laquelle se situe la date de début
+  des symptômes de l'infecteur ;
+* `y` est la date de début des symptômes de l'infecté.
+
+L'intervalle sériel vérifie donc $L_i = y_i - x^{ub}_i \le X_i \le R_i = y_i - x^{lb}_i$.
+C'est une donnée **censurée par intervalle**, alors que le code d'origine
+prenait le milieu de la fenêtre.
+
+Première lecture du fichier fourni :
+
+* 66 observations exactes et 11 censurées par intervalle, de largeurs 1 à 19 jours ;
+* deux intervalles sériels négatifs (ID 54 : −3 jours, ID 68 : −4 jours) ;
+* une fenêtre qui chevauche 0 (ID 63 : intervalle $[-7, 12]$) ;
+* trois intervalles nuls.
+
+La présence de valeurs négatives justifie l'usage de lois stables sur $\mathbb R$
+plutôt que de lois sur $\mathbb R_+$.
+
+> **À vérifier (provenance).** Les dates de `DONNEE.csv` vont du 4 janvier au
+> 4 mars 2020, alors que la série de Mayotte enregistre son premier cas le
+> 13 mars 2020. Ces paires ne peuvent donc pas être des transmissions observées
+> à Mayotte. Il faut préciser la source exacte des données dans l'article
+> (section 9.1) et adapter le titre de la sous-section si besoin.
+
+```{r si-data, eval=params$run_applications}
+## mise en forme commune des paramètres ajustés (utilisée aussi pour les données enzyme)
+fmt_fit <- function(fit, label) {
+  K <- nrow(fit$P)
+  data.frame(Method = label, Component = seq_len(K), Weight = fit$w,
+             alpha = fit$P[, 1], beta = fit$P[, 2], gamma = fit$P[, 3], delta = fit$P[, 4])
+}
+has_SI <- file.exists("data/DONNEE.csv")
+if (has_SI) {
+  dat <- read.table("data/DONNEE.csv", sep = ";", dec = ".", header = TRUE)
+  dat <- dat[!is.na(dat$y) & dat$y != "", ]                      # ligne vide finale éventuelle
+  as_d <- function(v) as.Date(as.character(v), format = "%d/%m/%Y")
+  xlb <- as_d(dat$x.lb); xub <- as_d(dat$x.ub); yy <- as_d(dat$y)
+  lo_si <- as.numeric(yy - xub); hi_si <- as.numeric(yy - xlb)
+  mid_si <- (lo_si + hi_si) / 2                      # ce qu'utilisait le code d'origine
+  cat("n =", length(lo_si), "; exacts :", sum(lo_si == hi_si),
+      "; censurés par intervalle :", sum(lo_si < hi_si), "\n")
+  cat("Période des dates :", format(min(xlb, yy)), "->", format(max(xub, yy)), "\n")
+  cat("Intervalles sériels négatifs (milieu) : ID", dat$ID[mid_si < 0], "\n")
+  cat("Fenêtres chevauchant 0 : ID", dat$ID[lo_si < 0 & hi_si > 0], "\n")
+  print(summary(mid_si))
+  knitr::kable(data.frame(ID = dat$ID, L = lo_si, R = hi_si)[lo_si < hi_si, ],
+               row.names = FALSE, caption = "Observations censurées par intervalle")
+} else message("data/DONNEE.csv introuvable : placez le fichier dans data/ pour cette partie.")
+```
+
+```{r si-hist, eval=params$run_applications, fig.height=3.5}
+if (has_SI) {
+  ## représentation des intervalles [L_i, R_i] triés
+  o <- order(mid_si)
+  plot(NA, xlim = range(c(lo_si, hi_si)), ylim = c(1, length(o)), yaxt = "n",
+       xlab = "Intervalle sériel (jours)", ylab = "paires (triées)", main = "Données censurées par intervalle")
+  segments(lo_si[o], seq_along(o), hi_si[o], seq_along(o), col = ifelse(lo_si[o] < hi_si[o], "red", "grey40"), lwd = 2)
+  points(mid_si[o], seq_along(o), pch = 20, cex = 0.6)
+  abline(v = 0, lty = 2)
+  legend("bottomright", c("exacte", "censurée par intervalle"), col = c("grey40", "red"), lwd = 2, bty = "n")
+}
+```
+
+```{r si-fit, eval=params$run_applications}
+if (has_SI) {
+  set.seed(134)
+  n_bay <- if (params$mode == "complet") c(6000, 2000) else c(1500, 500)
+  fits <- list()
+  for (K in 1:2) {
+    ini <- if (K == 1) list(w = 1, P = matrix(fit_cf(mid_si, method = "naive"), 1)) else
+           init_mix(lo_si, hi_si, K)
+    fits[[sprintf("Midpoint EM, K=%d", K)]] <- em_mix_cens(mid_si, mid_si, K, init = ini)
+    fits[[sprintf("Interval EM, K=%d", K)]] <- em_mix_cens(lo_si, hi_si, K, init = ini)
+  }
+  fits[["Interval SEM-CF, K=2"]] <- sem_mix_cens(lo_si, hi_si, 2, mstep = "cf", iters = 300, burn = 100)
+  fits[["Interval Bayes, K=2"]]  <- bayes_mix_cens(lo_si, hi_si, 2, n_iter = n_bay[1], burn = n_bay[2])
+
+  tabP <- do.call(rbind, Map(fmt_fit, fits, names(fits))); rownames(tabP) <- NULL
+  print(knitr::kable(tabP, digits = 3, caption = "Intervalle sériel : paramètres"))
+  tabPtex <- tabP; names(tabPtex)[4:7] <- c("$\\alpha$", "$\\beta$", "$\\gamma$", "$\\delta$")
+  write_tex_table(tabPtex, "tables/app_SI_par.tex", align = "lrrrrrr")
+
+  ic <- t(sapply(fits, function(f) info_crit(f$w, f$P, lo_si, hi_si)))
+  tabI <- data.frame(Method = rownames(ic), round(ic, 2), check.names = FALSE)
+  names(tabI) <- c("Method", "log-lik", "free par.", "AIC", "BIC")
+  print(knitr::kable(tabI, row.names = FALSE, caption = "Intervalle sériel : critères d'information"))
+  write_tex_table(tabI, "tables/app_SI_ic.tex", digits = 2, align = "lrrrr")
+  saveRDS(fits, "tables/app_SI_fits.rds")
+}
+```
+
+```{r si-plot, eval=params$run_applications}
+if (has_SI) {
+  plotSI <- function() {
+    hist(mid_si, freq = FALSE, breaks = 20, col = "grey90", border = "grey60",
+         main = "", xlab = "Intervalle sériel (jours, points milieux)")
+    xs <- seq(min(lo_si) - 5, max(hi_si) + 5, length.out = 500)
+    for (j in seq_along(fits)) lines(xs, dmix(xs, fits[[j]]$w, fits[[j]]$P), col = j, lwd = 2, lty = j)
+    legend("topright", names(fits), col = seq_along(fits), lty = seq_along(fits), lwd = 2, bty = "n", cex = 0.75)
+  }
+  plotSI()
+  pdf("figures/app_SI.pdf", width = 7, height = 4.5); plotSI(); invisible(dev.off())
+}
+```
+
+### Nombre de reproduction effectif $R_t$ et comparaison avec le tableau de bord
+
+La série `data/SERIE.csv` contient, pour chaque jour, les cas totaux
+(`Nouveaux_cas`), les cas par village (`*_casV`) et par commune (`*_cas`). Les
+dates sont au format **mois/jour/année** et la série est quotidienne et
+continue du 09/03/2020 au 11/01/2022 (674 jours). La somme des 17 communes est
+parfois inférieure au total, ce qui correspond aux cas sans commune renseignée.
+Le code d'origine lisait la version `.xlsx` de cette série ; on lit ici le CSV,
+et à défaut le `.xlsx`.
+
+On estime $R_t$ par l'équation de renouvellement (Cori et al., 2013), avec la
+loi de l'intervalle sériel du modèle de plus petit AIC, sur une fenêtre
+glissante de 7 jours. On compare ensuite aux valeurs « R0 au 2022-01-01 » et
+« R0 au 2022-01-08 » du tableau de bord (`Feuil2.csv`), pour le total et pour
+chaque commune. Le tableau de bord n'indique pas sa méthode ni sa fenêtre : il
+faut s'attendre à des écarts, et la comparaison sert de contrôle de cohérence.
+
+```{r rt-data, eval=params$run_applications}
+serie <- NULL
+if (file.exists("data/SERIE.csv")) {
+  serie <- read.csv("data/SERIE.csv", sep = ";", check.names = FALSE)
+  serie$Date <- as.Date(serie$Date, format = "%m/%d/%Y")
+} else if (file.exists("data/SERIE-SPATIAL.xlsx") && requireNamespace("readxl", quietly = TRUE)) {
+  serie <- as.data.frame(readxl::read_excel("data/SERIE-SPATIAL.xlsx", sheet = 1), check.names = FALSE)
+  serie$Date <- as.Date(serie$Date)
+}
+has_serie <- !is.null(serie)
+if (has_serie) {
+  communes <- setdiff(grep("_cas$", names(serie), value = TRUE), "Nouveaux_cas")
+  cat("Période :", format(min(serie$Date)), "->", format(max(serie$Date)),
+      "|", nrow(serie), "jours | total des cas :", sum(serie$Nouveaux_cas), "\n")
+  cat("Jours où la somme des communes < total :",
+      sum(rowSums(serie[, communes]) < serie$Nouveaux_cas), "\n")
+  plot(serie$Date, serie$Nouveaux_cas, type = "h", xlab = "", ylab = "nouveaux cas",
+       main = "Incidence quotidienne, Mayotte")
+} else message("Série d'incidence non disponible.")
+```
+
+```{r rt, eval=params$run_applications}
+if (has_SI && has_serie) {
+  best <- fits[[which.min(ic[, "AIC"])]]
+  cat("Modèle d'intervalle sériel retenu :", names(fits)[which.min(ic[, "AIC"])], "\n")
+  ws <- si_weights(best$w, best$P, smax = 30)
+  barplot(ws, names.arg = seq_along(ws), xlab = "s (jours)", ylab = "w_s",
+          main = "Intervalle de génération discrétisé (s >= 1)")
+
+  R_tot <- Rt_renewal(serie$Nouveaux_cas, ws, window = 7)
+  plotRt <- function() {
+    plot(serie$Date, R_tot, type = "l", lwd = 2, xlab = "", ylab = expression(R[t]),
+         ylim = c(0, 4)); abline(h = 1, lty = 2)
+  }
+  plotRt()
+  pdf("figures/app_Rt.pdf", width = 7, height = 3.5); plotRt(); invisible(dev.off())
+}
+```
+
+```{r rt-compare, eval=params$run_applications}
+read_feuil2 <- function(f) {
+  L <- strsplit(readLines(f, encoding = "UTF-8"), ";")
+  L <- L[sapply(L, length) >= 16 & !sapply(L, function(r) r[1] %in% c("", "Catégorie"))]
+  data.frame(Categorie = sapply(L, `[`, 1), Variable = sapply(L, `[`, 2),
+             R0_0101 = as.numeric(sapply(L, `[`, 14)), R0_0108 = as.numeric(sapply(L, `[`, 15)),
+             IC_0108 = sapply(L, `[`, 16), stringsAsFactors = FALSE)
+}
+if (has_SI && has_serie && file.exists("data/Feuil2.csv")) {
+  tb <- read_feuil2("data/Feuil2.csv")
+  tb <- tb[tb$Categorie %in% c("Total", "Commune"), ]
+  Rt_at <- function(x, date) Rt_renewal(x, ws, window = 7)[match(as.Date(date), serie$Date)]
+  tb$Rt_0101 <- tb$Rt_0108 <- NA
+  for (i in seq_len(nrow(tb))) {
+    col <- if (tb$Categorie[i] == "Total") "Nouveaux_cas" else paste0(tb$Variable[i], "_cas")
+    if (col %in% names(serie)) {
+      tb$Rt_0101[i] <- Rt_at(serie[[col]], "2022-01-01")
+      tb$Rt_0108[i] <- Rt_at(serie[[col]], "2022-01-08")
+    }
+  }
+  knitr::kable(tb[, c("Variable", "R0_0101", "Rt_0101", "R0_0108", "IC_0108", "Rt_0108")],
+               digits = 2, row.names = FALSE,
+               col.names = c("Zone", "Tableau 01/01", "Modèle 01/01", "Tableau 08/01", "IC tableau", "Modèle 08/01"),
+               caption = "R au 1er et au 8 janvier 2022 : tableau de bord et modèle stable")
+}
+```
+
+```{r feuil1, eval=params$run_applications}
+## Tableau de bord complémentaire (incidence, positivité, scoring) : affichage descriptif
+if (file.exists("data/Feuil1.csv")) {
+  f1 <- read.csv("data/Feuil1.csv", sep = ";", skip = 33, check.names = FALSE, encoding = "UTF-8")
+  f1 <- f1[f1[[1]] != "", seq_len(min(17, ncol(f1)))]
+  knitr::kable(f1, caption = "Feuil1 : indicateurs de début janvier 2022")
+}
+```
+
+## Données enzyme avec censure artificielle
+
+Les données enzyme ($n = 245$) ne sont pas censurées. On les censure
+artificiellement à droite, à environ 20 %, par une variable log-normale
+indépendante. Le paramètre $\mu$ de cette variable est calibré de façon
+déterministe grâce à $P(X_i > C) = \Phi\{(\log X_i - \mu)/0.6\}$. On compare
+ensuite les ajustements obtenus sur les données censurées à celui obtenu sur
+les données complètes, qui sert de référence connue.
+
+```{r enzyme-data, eval=params$run_applications}
+enz <- NULL
+if (requireNamespace("BNPdensity", quietly = TRUE)) {
+  e <- new.env(); try(utils::data("enzyme", package = "BNPdensity", envir = e), silent = TRUE)
+  if (exists("enzyme", envir = e)) enz <- as.numeric(unlist(get("enzyme", envir = e)))
+}
+if (is.null(enz) && file.exists("data/enzyme.csv")) enz <- as.numeric(read.csv("data/enzyme.csv")[[1]])
+has_enz <- !is.null(enz)
+if (has_enz) {
+  set.seed(134)
+  n <- length(enz); sdl <- 0.6
+  mu <- uniroot(function(m) mean(pnorm((log(pmax(enz, 1e-8)) - m) / sdl)) - 0.20, c(-10, 10))$root
+  cc <- exp(rnorm(n, mu, sdl)); y_e <- pmin(enz, cc); d_e <- as.numeric(enz <= cc)
+  lo_e <- y_e; hi_e <- ifelse(d_e == 1, y_e, Inf)
+  cat("Enzyme : n =", n, "; taux de censure =", round(mean(d_e == 0), 3), "\n")
+} else message("Données enzyme introuvables (paquet BNPdensity ou data/enzyme.csv).")
+```
+
+```{r enzyme-fit, eval=params$run_applications}
+if (has_enz) {
+  n_bay <- if (params$mode == "complet") c(6000, 2000) else c(1500, 500)
+  ini <- init_mix(enz, enz, 2)
+  fitsE <- list(
+    "Full data EM"       = em_mix_cens(enz, enz, 2, init = ini),
+    "Censored, naive EM" = em_mix_cens(y_e, y_e, 2, init = ini),
+    "Censored EM"        = em_mix_cens(lo_e, hi_e, 2, init = ini),
+    "Censored SEM-CF"    = sem_mix_cens(lo_e, hi_e, 2, mstep = "cf", iters = 300, burn = 100),
+    "Censored Bayes"     = bayes_mix_cens(lo_e, hi_e, 2, n_iter = n_bay[1], burn = n_bay[2]))
+  tabE <- do.call(rbind, Map(fmt_fit, fitsE, names(fitsE))); rownames(tabE) <- NULL
+  print(knitr::kable(tabE, digits = 3, caption = "Enzyme : paramètres"))
+  tabEtex <- tabE; names(tabEtex)[4:7] <- c("$\\alpha$", "$\\beta$", "$\\gamma$", "$\\delta$")
+  write_tex_table(tabEtex, "tables/app_enzyme_par.tex", align = "lrrrrrr")
+
+  xs_e <- seq(min(enz) - 0.5, max(enz) + 0.5, length.out = 600)
+  fref <- dmix(xs_e, fitsE[[1]]$w, fitsE[[1]]$P)
+  l1 <- sapply(fitsE[-1], function(f) sum(abs(dmix(xs_e, f$w, f$P) - fref)) * diff(xs_e)[1])
+  tabL1 <- data.frame(Method = names(l1), `L1 to full-data fit` = l1, check.names = FALSE)
+  print(knitr::kable(tabL1, digits = 3, row.names = FALSE, caption = "Distance L1 à l'ajustement complet"))
+  write_tex_table(tabL1, "tables/app_enzyme_L1.tex", align = "lr")
+  saveRDS(fitsE, "tables/app_enzyme_fits.rds")
+}
+```
+
+```{r enzyme-plot, eval=params$run_applications}
+if (has_enz) {
+  plotE <- function() {
+    hist(enz, freq = FALSE, breaks = 40, col = "grey90", border = "grey60", main = "",
+         xlab = "Activité enzymatique", ylim = c(0, 4))
+    for (j in seq_along(fitsE)) lines(xs_e, dmix(xs_e, fitsE[[j]]$w, fitsE[[j]]$P), col = j, lwd = 2, lty = j)
+    legend("topright", names(fitsE), col = seq_along(fitsE), lty = seq_along(fitsE), lwd = 2, bty = "n", cex = 0.75)
+  }
+  plotE()
+  pdf("figures/app_enzyme.pdf", width = 7, height = 4.5); plotE(); invisible(dev.off())
+}
+```
+
+# Récapitulatif et étape suivante
+
+```{r recap}
+cat("Tableaux produits :\n"); print(list.files("tables", pattern = "\\.tex$"))
+cat("Figures produites :\n"); print(list.files("figures", pattern = "\\.pdf$"))
+```
+
+Pour intégrer les résultats à l'article, recompilez `main.tex` (`latexmk -pdf main.tex`) :
+les encadrés « Pending » sont remplacés par ces fichiers. Les tableaux du mode
+`rapide` ne servent qu'à vérifier le code. Pour l'article, relancez le notebook
+avec `params$mode = "complet"`, par exemple :
+
+```r
+rmarkdown::render("notebook_stable_censure.Rmd", params = list(mode = "complet"))
+```
+
+```{r}
+write.csv(as.data.frame(EuStockMarkets), "EuStockMarkets.csv", row.names = FALSE)
+```
+
