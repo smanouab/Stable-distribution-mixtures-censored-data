@@ -163,7 +163,8 @@ Laboratoire de Mathématiques et Applications (UMR CNRS 7348)
 École  d'Ingénieurs ENSAR, Université de Poitiers, France
 
 **Ibrahim SADOK**
-
+Department of Mathematics and Computer Science, Faculty of Exact Sciences, University of Bechar, Algeria
+Laboratory of Mathematics, Djillali Liabes University of Sidi Bel-Abbès, Sidi Bel-Abbès, Algeria
 ## Citation
 
 If you use this code or the associated computational framework in your research, please cite the corresponding research article:
